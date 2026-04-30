@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import timeit
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
+
+from basics.basics.model import BasicsTransformerLM
 
 
 @dataclass(frozen=True)
@@ -55,14 +59,47 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
 def build_model(config: BenchmarkConfig) -> torch.nn.Module:
     """Instantiate the staff Basics transformer for the requested model size."""
-    raise NotImplementedError
+    spec = MODEL_SPECS[config.model_size]
+
+    model = BasicsTransformerLM(
+        vocab_size=config.vocab_size,
+        context_length=config.context_length,
+        d_model=spec.d_model,
+        num_layers=spec.num_layers,
+        num_heads=spec.num_heads,
+        d_ff=spec.d_ff,
+        rope_theta=10_000.0,
+    )
+
+    return model
 
 
 def make_random_batch(config: BenchmarkConfig, device: torch.device) -> torch.Tensor:
     """Construct a random token batch for benchmarking and profiling."""
-    raise NotImplementedError
+    return torch.randint(
+        low=0,
+        high=config.vocab_size,
+        size=(config.batch_size, config.context_length),
+        device=device,
+        dtype=torch.long,
+    )
 
 
 def run_single_step(
@@ -72,32 +109,139 @@ def run_single_step(
     autocast_context,
 ) -> None:
     """Execute one benchmark step and synchronize CUDA before returning."""
-    raise NotImplementedError
+    device = batch.device
+
+    if mode == "forward":
+        with torch.no_grad():
+            with autocast_context:
+                _ = model(batch)
+
+    elif mode == "forward-backward":
+        model.zero_grad(set_to_none=True)
+
+        with autocast_context:
+            logits = model(batch)
+            loss = F.cross_entropy(
+                logits[:, :-1, :].reshape(-1, logits.size(-1)),
+                batch[:, 1:].reshape(-1),
+            )
+
+        loss.backward()
+
+    elif mode == "train-step":
+        if not hasattr(model, "_benchmark_optimizer"):
+            model._benchmark_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        optimizer = model._benchmark_optimizer
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast_context:
+            logits = model(batch)
+            loss = F.cross_entropy(
+                logits[:, :-1, :].reshape(-1, logits.size(-1)),
+                batch[:, 1:].reshape(-1),
+            )
+
+        loss.backward()
+        optimizer.step()
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    synchronize(device)
 
 
 def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     """Run warmup steps followed by timed measurement steps."""
-    raise NotImplementedError
+    device = get_device()
+    model = build_model(config).to(device)
+    model.train()
+
+    if config.compile_model:
+        model = torch.compile(model)
+
+    batch = make_random_batch(config, device)
+    autocast_context = make_autocast_context(config.use_bf16)
+
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    maybe_start_memory_history(config.use_memory_profiler)
+
+    for _ in range(config.warmup_steps):
+        run_single_step(model, batch, config.mode, autocast_context)
+
+    times: list[float] = []
+
+    for _ in range(config.measure_steps):
+        start = timeit.default_timer()
+        run_single_step(model, batch, config.mode, autocast_context)
+        end = timeit.default_timer()
+        times.append(end - start)
+
+    maybe_dump_memory_snapshot(
+        config.use_memory_profiler,
+        config.output_dir / f"{config.model_size}_{config.mode}_memory.pickle",
+    )
+
+    times_tensor = torch.tensor(times)
+    avg_time = times_tensor.mean().item()
+    std_time = times_tensor.std(unbiased=False).item()
+
+    results = {
+        "avg_time_sec": avg_time,
+        "std_time_sec": std_time,
+    }
+
+    print("Benchmark results")
+    print("-----------------")
+    print(f"device:        {device}")
+    print(f"model size:    {config.model_size}")
+    print(f"mode:          {config.mode}")
+    print(f"bf16:          {config.use_bf16}")
+    print(f"compiled:      {config.compile_model}")
+    print(f"batch size:    {config.batch_size}")
+    print(f"context len:   {config.context_length}")
+    print(f"warmup steps:  {config.warmup_steps}")
+    print(f"measure steps: {config.measure_steps}")
+    print()
+    print(f"avg time:      {avg_time:.6f} s")
+    print(f"std time:      {std_time:.6f} s")
+
+    return results
 
 
 def annotated_scaled_dot_product_attention(*args, **kwargs):
     """Optional NVTX-annotated attention path for Nsight Systems profiling."""
-    raise NotImplementedError
+    if torch.cuda.is_available():
+        with torch.cuda.nvtx.range("scaled_dot_product_attention"):
+            return F.scaled_dot_product_attention(*args, **kwargs)
+
+    return F.scaled_dot_product_attention(*args, **kwargs)
 
 
 def maybe_start_memory_history(enabled: bool) -> None:
     if enabled:
-        raise NotImplementedError
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA memory profiler requires a CUDA device.")
+
+        torch.cuda.memory._record_memory_history(max_entries=100_000)
 
 
 def maybe_dump_memory_snapshot(enabled: bool, output_path: Path) -> None:
     if enabled:
-        raise NotImplementedError
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA memory profiler requires a CUDA device.")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.cuda.memory._dump_snapshot(str(output_path))
 
 
 def make_autocast_context(use_bf16: bool):
     if use_bf16:
+        if not torch.cuda.is_available():
+            raise RuntimeError("--use-bf16 is currently configured for CUDA autocast only.")
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
     return nullcontext()
 
 
