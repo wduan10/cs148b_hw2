@@ -11,6 +11,45 @@ import torch
 import torch.nn.functional as F
 
 from basics.basics.model import BasicsTransformerLM
+import math
+import torch
+import torch.cuda.nvtx as nvtx
+from einops import einsum
+
+from basics.basics.nn_utils import softmax
+import basics.basics.model
+
+def annotated_scaled_dot_product_attention(
+    Q,
+    K,
+    V,
+    mask=None,
+):
+    """NVTX-annotated scaled dot-product attention for Nsight Systems profiling."""
+
+    d_k = K.shape[-1]
+
+    with nvtx.range("computing attention scores"):
+        attention_scores = (
+            einsum(Q, K, "... query d_k, ... key d_k -> ... query key")
+            / math.sqrt(d_k)
+        )
+
+    if mask is not None:
+        with nvtx.range("applying attention mask"):
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
+
+    with nvtx.range("computing softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)
+
+    with nvtx.range("final matmul"):
+        output = einsum(
+            attention_weights,
+            V,
+            "... query key, ... key d_v -> ... query d_v",
+        )
+
+    return output
 
 
 @dataclass(frozen=True)
@@ -113,20 +152,23 @@ def run_single_step(
 
     if mode == "forward":
         with torch.no_grad():
-            with autocast_context:
-                _ = model(batch)
+            with nvtx.range("forward"):
+                with autocast_context:
+                    _ = model(batch)
 
     elif mode == "forward-backward":
         model.zero_grad(set_to_none=True)
 
-        with autocast_context:
-            logits = model(batch)
-            loss = F.cross_entropy(
-                logits[:, :-1, :].reshape(-1, logits.size(-1)),
-                batch[:, 1:].reshape(-1),
-            )
+        with nvtx.range("forward"):
+            with autocast_context:
+                logits = model(batch)
+                loss = F.cross_entropy(
+                    logits[:, :-1, :].reshape(-1, logits.size(-1)),
+                    batch[:, 1:].reshape(-1),
+                )
 
-        loss.backward()
+        with nvtx.range("backward"):
+            loss.backward()
 
     elif mode == "train-step":
         if not hasattr(model, "_benchmark_optimizer"):
@@ -135,15 +177,19 @@ def run_single_step(
         optimizer = model._benchmark_optimizer
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast_context:
-            logits = model(batch)
-            loss = F.cross_entropy(
-                logits[:, :-1, :].reshape(-1, logits.size(-1)),
-                batch[:, 1:].reshape(-1),
-            )
+        with nvtx.range("forward"):
+            with autocast_context:
+                logits = model(batch)
+                loss = F.cross_entropy(
+                    logits[:, :-1, :].reshape(-1, logits.size(-1)),
+                    batch[:, 1:].reshape(-1),
+                )
 
-        loss.backward()
-        optimizer.step()
+        with nvtx.range("backward"):
+            loss.backward()
+
+        with nvtx.range("optimizer_step"):
+            optimizer.step()
 
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -152,6 +198,8 @@ def run_single_step(
 
 
 def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
+    basics.basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+
     """Run warmup steps followed by timed measurement steps."""
     device = get_device()
     model = build_model(config).to(device)
@@ -167,15 +215,17 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
 
     maybe_start_memory_history(config.use_memory_profiler)
 
-    for _ in range(config.warmup_steps):
-        run_single_step(model, batch, config.mode, autocast_context)
+    for i in range(config.warmup_steps):
+        with nvtx.range(f"warmup_step_{i}"):
+            run_single_step(model, batch, config.mode, autocast_context)
 
     times: list[float] = []
 
-    for _ in range(config.measure_steps):
-        start = timeit.default_timer()
-        run_single_step(model, batch, config.mode, autocast_context)
-        end = timeit.default_timer()
+    for i in range(config.measure_steps):
+        with nvtx.range(f"measure_step_{i}"):
+            start = timeit.default_timer()
+            run_single_step(model, batch, config.mode, autocast_context)
+            end = timeit.default_timer()
         times.append(end - start)
 
     maybe_dump_memory_snapshot(
@@ -208,15 +258,6 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     print(f"std time:      {std_time:.6f} s")
 
     return results
-
-
-def annotated_scaled_dot_product_attention(*args, **kwargs):
-    """Optional NVTX-annotated attention path for Nsight Systems profiling."""
-    if torch.cuda.is_available():
-        with torch.cuda.nvtx.range("scaled_dot_product_attention"):
-            return F.scaled_dot_product_attention(*args, **kwargs)
-
-    return F.scaled_dot_product_attention(*args, **kwargs)
 
 
 def maybe_start_memory_history(enabled: bool) -> None:
