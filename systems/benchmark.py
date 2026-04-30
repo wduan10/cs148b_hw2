@@ -10,7 +10,7 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
-from basics.model import BasicsTransformerLM
+from basics.basics.model import BasicsTransformerLM
 
 
 @dataclass(frozen=True)
