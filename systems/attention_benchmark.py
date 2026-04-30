@@ -60,12 +60,17 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor
     return out
 
 
-def benchmark_attention_once(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> dict[str, float]:
+def benchmark_attention_once(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_fn,
+) -> dict[str, float]:
     device = q.device
 
     # Warmup
     for _ in range(10):
-        out = attention(q, k, v)
+        out = attention_fn(q, k, v)
         loss = out.sum()
         loss.backward()
         q.grad = k.grad = v.grad = None
@@ -75,19 +80,19 @@ def benchmark_attention_once(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) 
     sync(device)
     start = time.perf_counter()
     for _ in range(100):
-        out = attention(q, k, v)
+        out = attention_fn(q, k, v)
         sync(device)
     forward_time = time.perf_counter() - start
 
     # Measure memory before backward
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
-        out = attention(q, k, v)
+        out = attention_fn(q, k, v)
         loss = out.sum()
         sync(device)
         memory_before_backward_mb = torch.cuda.memory_allocated() / (1024 ** 2)
     else:
-        out = attention(q, k, v)
+        out = attention_fn(q, k, v)
         loss = out.sum()
         memory_before_backward_mb = float("nan")
 
@@ -96,7 +101,7 @@ def benchmark_attention_once(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) 
     start = time.perf_counter()
     for _ in range(100):
         q.grad = k.grad = v.grad = None
-        out = attention(q, k, v)
+        out = attention_fn(q, k, v)
         loss = out.sum()
         loss.backward()
         sync(device)
@@ -120,6 +125,10 @@ def benchmark_attention_grid(config: AttentionBenchmarkConfig) -> list[dict[str,
     device = get_device()
     results = []
 
+    attention_fn = attention
+    if config.compile_attention:
+        attention_fn = torch.compile(attention)
+
     for head_dim, sequence_length in iter_benchmark_shapes(config):
         try:
             if device.type == "cuda":
@@ -133,11 +142,12 @@ def benchmark_attention_grid(config: AttentionBenchmarkConfig) -> list[dict[str,
                 device,
             )
 
-            result = benchmark_attention_once(q, k, v)
+            result = benchmark_attention_once(q, k, v, attention_fn)
 
             row = {
                 "head_dim": head_dim,
                 "sequence_length": sequence_length,
+                "compiled": config.compile_attention,
                 "status": "ok",
                 **result,
             }
@@ -146,6 +156,7 @@ def benchmark_attention_grid(config: AttentionBenchmarkConfig) -> list[dict[str,
             row = {
                 "head_dim": head_dim,
                 "sequence_length": sequence_length,
+                "compiled": config.compile_attention,
                 "status": "OOM",
                 "forward_time_s": float("nan"),
                 "backward_time_s": float("nan"),
