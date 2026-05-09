@@ -111,12 +111,125 @@ def run_direct_baseline(output_path: Path) -> None:
 
 def run_cot_baseline(output_path: Path) -> None:
     """Evaluate the chain-of-thought baseline from Section 3.2."""
-    raise NotImplementedError
+    vllm = import_module("vllm")
+
+    examples = load_gsm8k_examples("test")
+    prompts = build_prompts(examples, COT_PROMPT_TEMPLATE)
+    sampling_params = vllm.SamplingParams(
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=1024,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+    )
+    model = vllm.LLM(model=DEFAULT_MODEL_NAME)
+    results = evaluate_vllm(
+        model,
+        answer_tag_reward_fn,
+        prompts,
+        sampling_params,
+        examples=examples,
+    )
+    write_evaluation_results(results, output_path)
+
+
+def evaluate_vllm_self_consistency(
+    vllm_model,
+    reward_fn: Callable[[str, str], dict[str, float]],
+    prompts: Sequence[str],
+    eval_sampling_params,
+    k: int,
+    ground_truths: Sequence[str] | None = None,
+    examples: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """
+    Sample k responses per prompt, take majority vote over extracted answers,
+    score the voted answer, and return evaluation artifacts including per-example
+    vote distributions.
+    """
+    from .rewards import extract_answer_from_tags, majority_vote_tagged_answers
+    from collections import Counter
+
+    if ground_truths is None:
+        if examples is None:
+            raise ValueError("Pass ground_truths or examples so generated responses can be scored.")
+        ground_truths = [_example_ground_truth(example) for example in examples]
+
+    if len(prompts) != len(ground_truths):
+        raise ValueError(
+            f"Expected one ground truth per prompt, got {len(prompts)} prompts and {len(ground_truths)} labels."
+        )
+
+    # Repeat each prompt k times so vLLM can batch all samples in one call.
+    repeated_prompts = [p for p in prompts for _ in range(k)]
+    request_outputs = vllm_model.generate(repeated_prompts, eval_sampling_params)
+    all_texts = [_first_vllm_text(out) for out in request_outputs]
+
+    records = []
+    reward_infos = []
+    for i, (prompt, ground_truth) in enumerate(zip(prompts, ground_truths, strict=True)):
+        responses = all_texts[i * k : (i + 1) * k]
+        voted_answer = majority_vote_tagged_answers(responses)
+
+        # Score by wrapping the voted answer back into tags for the reward fn.
+        if voted_answer is not None:
+            scored_response = f"<answer>{voted_answer}</answer>"
+        else:
+            scored_response = ""
+        reward_info = reward_fn(scored_response, ground_truth)
+        reward_infos.append(reward_info)
+
+        # Compute vote distribution for analysis.
+        extracted = [extract_answer_from_tags(r) for r in responses]
+        parsed = [a for a in extracted if a is not None]
+        vote_counts = dict(Counter(parsed))
+        n_ties = sum(1 for c in vote_counts.values() if c == max(vote_counts.values(), default=0)) if len(vote_counts) > 1 else 0
+
+        record: dict[str, Any] = {
+            "idx": i,
+            "prompt": prompt,
+            "responses": responses,
+            "voted_answer": voted_answer,
+            "ground_truth": ground_truth,
+            "vote_counts": vote_counts,
+            "n_ties": n_ties,
+            "reward": reward_info,
+        }
+        if examples is not None:
+            record["example"] = dict(examples[i])
+        records.append(record)
+
+    n_with_ties = sum(1 for r in records if r["n_ties"] > 1)
+    return {
+        "metrics": _summarize_rewards(reward_infos),
+        "n_with_ties": n_with_ties,
+        "examples": records,
+    }
 
 
 def run_self_consistency_baseline(output_path: Path, k: int = 5) -> None:
     """Evaluate the self-consistency baseline from Section 3.2."""
-    raise NotImplementedError
+    vllm = import_module("vllm")
+
+    examples = load_gsm8k_examples("test")
+    prompts = build_prompts(examples, COT_PROMPT_TEMPLATE)
+    sampling_params = vllm.SamplingParams(
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=1024,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+    )
+    model = vllm.LLM(model=DEFAULT_MODEL_NAME)
+    results = evaluate_vllm_self_consistency(
+        model,
+        answer_tag_reward_fn,
+        prompts,
+        sampling_params,
+        k=k,
+        examples=examples,
+    )
+    write_evaluation_results(results, output_path)
 
 
 def get_prompt_template(use_cot: bool) -> str:
