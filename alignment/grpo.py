@@ -357,14 +357,19 @@ def train_grpo(
         labels = tokenized["labels"].to(device)
         response_mask = tokenized["response_mask"].to(device)
 
+        # Cache old log-probs in micro-sized chunks so we never materialise
+        # the full-batch logit tensor (batch × seq_len × vocab) at once.
+        old_log_probs_chunks: list[Tensor] = []
         with torch.no_grad():
-            old_log_prob_dict = get_response_log_probs(
-                model=policy,
-                input_ids=input_ids,
-                labels=labels,
-                return_token_entropy=False,
-            )
-        old_log_probs = old_log_prob_dict["log_probs"].detach()
+            for c in range(0, rollout_batch_size, micro_train_batch_size):
+                chunk_dict = get_response_log_probs(
+                    model=policy,
+                    input_ids=input_ids[c : c + micro_train_batch_size],
+                    labels=labels[c : c + micro_train_batch_size],
+                    return_token_entropy=False,
+                )
+                old_log_probs_chunks.append(chunk_dict["log_probs"].detach())
+        old_log_probs = torch.cat(old_log_probs_chunks, dim=0)
 
         # ── 4. Gradient update epochs ────────────────────────────────────────
         step_losses: list[float] = []
