@@ -324,11 +324,7 @@ def train_grpo(
     for step in range(n_grpo_steps):
         policy.eval()
 
-        # ── 1. Wake vLLM and sample a rollout batch ──────────────────────────
-        # Reload vLLM weights from CPU pinned memory back to GPU for generation.
-        if hasattr(vllm_model, "wake_up"):
-            vllm_model.wake_up()
-        torch.cuda.empty_cache()
+        # ── 1. Sample a rollout batch ─────────────────────────────────────────
         batch_indices = random.sample(range(len(prompts_train)), n_prompts_per_rollout_batch)
         batch_prompts = [prompts_train[i] for i in batch_indices]
         batch_ground_truths = [train_examples[i]["ground_truth"] for i in batch_indices]
@@ -351,13 +347,7 @@ def train_grpo(
         )
         advantages = advantages.to(device)
 
-        # ── 3. Free vLLM GPU memory before HF forward/backward passes ───────
-        # vLLM holds the KV cache and model weights on GPU; sleep() moves them
-        # to CPU pinned memory so the HF policy has room to run.
-        vllm_model.sleep(level=1)
-        torch.cuda.empty_cache()
-
-        # ── Tokenize rollouts and cache old log-probs (no grad) ─────────────
+        # ── 3. Tokenize rollouts and cache old log-probs (no grad) ──────────
         tokenized = tokenize_prompt_and_output(
             prompt_strs=repeated_prompts,
             output_strs=rollout_responses,
