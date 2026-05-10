@@ -324,7 +324,10 @@ def train_grpo(
     for step in range(n_grpo_steps):
         policy.eval()
 
-        # ── 1. Sample a rollout batch ────────────────────────────────────────
+        # ── 1. Wake vLLM and sample a rollout batch ──────────────────────────
+        # wake_up() is a no-op if vLLM is already active.
+        vllm_model.wake_up()
+        torch.cuda.empty_cache()
         batch_indices = random.sample(range(len(prompts_train)), n_prompts_per_rollout_batch)
         batch_prompts = [prompts_train[i] for i in batch_indices]
         batch_ground_truths = [train_examples[i]["ground_truth"] for i in batch_indices]
@@ -413,10 +416,6 @@ def train_grpo(
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
             optimizer.step()
             step_grad_norms.append(float(grad_norm))
-
-        # ── Restore vLLM GPU memory for the next rollout / validation ────────
-        torch.cuda.empty_cache()
-        vllm_model.wake_up()
 
         train_log: dict[str, Any] = {
             "step": step,
