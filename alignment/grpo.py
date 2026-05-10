@@ -347,7 +347,13 @@ def train_grpo(
         )
         advantages = advantages.to(device)
 
-        # ── 3. Tokenize rollouts and cache old log-probs (no grad) ──────────
+        # ── 3. Free vLLM GPU memory before HF forward/backward passes ───────
+        # vLLM holds the KV cache and model weights on GPU; sleep() moves them
+        # to CPU pinned memory so the HF policy has room to run.
+        vllm_model.sleep(level=1)
+        torch.cuda.empty_cache()
+
+        # ── Tokenize rollouts and cache old log-probs (no grad) ─────────────
         tokenized = tokenize_prompt_and_output(
             prompt_strs=repeated_prompts,
             output_strs=rollout_responses,
@@ -407,6 +413,10 @@ def train_grpo(
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
             optimizer.step()
             step_grad_norms.append(float(grad_norm))
+
+        # ── Restore vLLM GPU memory for the next rollout / validation ────────
+        torch.cuda.empty_cache()
+        vllm_model.wake_up()
 
         train_log: dict[str, Any] = {
             "step": step,
