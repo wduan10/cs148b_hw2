@@ -325,8 +325,9 @@ def train_grpo(
         policy.eval()
 
         # ── 1. Wake vLLM and sample a rollout batch ──────────────────────────
-        # wake_up() is a no-op if vLLM is already active.
-        vllm_model.wake_up()
+        # Reload vLLM weights from CPU pinned memory back to GPU for generation.
+        if hasattr(vllm_model, "wake_up"):
+            vllm_model.wake_up()
         torch.cuda.empty_cache()
         batch_indices = random.sample(range(len(prompts_train)), n_prompts_per_rollout_batch)
         batch_prompts = [prompts_train[i] for i in batch_indices]
